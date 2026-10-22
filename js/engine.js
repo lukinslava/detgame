@@ -1,0 +1,340 @@
+// Игровая логика. Чистые функции над объектом состояния: никакой сети и DOM.
+// Состояние хранит только ведущий (host). Остальные получают «вид» через viewFor().
+
+export const MAX_PLAYERS = 6;
+export const HAND_SIZE = { 1: 6, 2: 4, 3: 3, 4: 3, 5: 2, 6: 2 };
+
+const LOG_LIMIT = 200;
+const CHAT_LIMIT = 100;
+
+function randomId(len = 6) {
+  const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let s = '';
+  for (let i = 0; i < len; i++) s += abc[Math.floor(Math.random() * abc.length)];
+  return s;
+}
+
+export function cardById(caseData, id) {
+  return caseData.cards.find((c) => c.id === id);
+}
+
+export function createGame(caseData, host) {
+  const state = {
+    caseId: caseData.id,
+    phase: 'lobby',
+    hostSecret: host.secret,
+    players: [],
+    deck: [],
+    table: [],
+    archive: [],
+    turn: 0,
+    endDrawn: false,
+    log: [],
+    chat: [],
+    answers: {},
+    ready: {},
+    result: null,
+    rev: 0,
+  };
+  addPlayer(state, host);
+  return state;
+}
+
+function player(state, secret) {
+  return state.players.find((p) => p.secret === secret);
+}
+
+function nameOf(state, pid) {
+  const p = state.players.find((x) => x.pid === pid);
+  return p ? p.name : '?';
+}
+
+function log(state, text) {
+  state.log.push({ at: Date.now(), text });
+  if (state.log.length > LOG_LIMIT) state.log.splice(0, state.log.length - LOG_LIMIT);
+}
+
+function cleanName(name) {
+  const s = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+  return s || 'Сыщик';
+}
+
+// Новый игрок или переподключение старого. Возвращает {ok, error?, player?}.
+export function addPlayer(state, { secret, name }) {
+  const existing = player(state, secret);
+  if (existing) {
+    existing.online = true;
+    if (state.phase === 'lobby' && name) existing.name = cleanName(name);
+    return { ok: true, player: existing };
+  }
+  if (state.phase !== 'lobby') return { ok: false, error: 'Игра уже началась. Новые игроки не могут присоединиться.' };
+  if (state.players.length >= MAX_PLAYERS) return { ok: false, error: 'В комнате уже 6 сыщиков.' };
+  let pid = randomId(5);
+  while (state.players.some((p) => p.pid === pid)) pid = randomId(5);
+  const p = { pid, secret, name: cleanName(name), online: true, hand: [] };
+  state.players.push(p);
+  if (state.players.length > 1) log(state, `${p.name} присоединяется к расследованию`);
+  state.rev++;
+  return { ok: true, player: p };
+}
+
+export function setOnline(state, secret, online) {
+  const p = player(state, secret);
+  if (!p || p.online === online) return false;
+  p.online = online;
+  state.rev++;
+  return true;
+}
+
+// Берём карты сверху колоды, пока не попадётся обычная карта.
+// Повороты сюжета сразу ложатся на стол, «Дело закрыто» останавливает добор.
+function drawInto(state, caseData, p) {
+  while (state.deck.length && !state.endDrawn) {
+    const id = state.deck.shift();
+    const card = cardById(caseData, id);
+    if (card.type === 'twist') {
+      state.table.push({ id, by: null, kind: 'twist' });
+      log(state, `Поворот сюжета: «${card.title}»`);
+      continue;
+    }
+    if (card.type === 'end') {
+      state.endDrawn = true;
+      state.table.push({ id, by: null, kind: 'end' });
+      log(state, 'Колода закончилась: дело закрыто. Доиграйте карты с рук');
+      return;
+    }
+    p.hand.push(id);
+    return;
+  }
+}
+
+export function startGame(state, caseData) {
+  if (state.phase !== 'lobby') return { ok: false, error: 'Игра уже идёт.' };
+  const n = state.players.length;
+  const size = HAND_SIZE[n];
+  state.deck = caseData.cards.map((c) => c.id);
+  state.table = [];
+  state.archive = [];
+  state.endDrawn = false;
+  state.answers = {};
+  state.ready = {};
+  state.result = null;
+  state.log = [];
+  for (const p of state.players) p.hand = [];
+  for (let r = 0; r < size; r++) {
+    for (const p of state.players) drawInto(state, caseData, p);
+  }
+  state.phase = 'play';
+  state.turn = Math.floor(Math.random() * n);
+  log(state, `Расследование началось. Первым ходит ${state.players[state.turn].name}`);
+  advanceIfStuck(state);
+  state.rev++;
+  return { ok: true };
+}
+
+// Если у текущего игрока пусто — передаём ход дальше. Если пусто у всех — к вопросам.
+function advanceIfStuck(state) {
+  const n = state.players.length;
+  for (let i = 0; i < n; i++) {
+    const idx = (state.turn + i) % n;
+    if (state.players[idx].hand.length) {
+      state.turn = idx;
+      return;
+    }
+  }
+  state.phase = 'questions';
+  log(state, 'Все карты сыграны. Пора отвечать на вопросы следователя');
+}
+
+function nextTurn(state) {
+  state.turn = (state.turn + 1) % state.players.length;
+  advanceIfStuck(state);
+}
+
+export function canPlayFaceUp(state, caseData, cardId) {
+  const card = cardById(caseData, cardId);
+  return !!card && (card.value ?? 0) <= state.archive.length;
+}
+
+// Действие игрока. Возвращает {ok, error?}.
+export function applyAction(state, caseData, secret, action) {
+  const p = player(state, secret);
+  if (!p) return { ok: false, error: 'Вы не в этой игре.' };
+  const isHost = secret === state.hostSecret;
+  const a = action || {};
+
+  switch (a.type) {
+    case 'chat': {
+      const text = String(a.text || '').trim().slice(0, 300);
+      if (!text) return { ok: false, error: 'Пустое сообщение.' };
+      state.chat.push({ at: Date.now(), pid: p.pid, text });
+      if (state.chat.length > CHAT_LIMIT) state.chat.splice(0, state.chat.length - CHAT_LIMIT);
+      state.rev++;
+      return { ok: true };
+    }
+
+    case 'rename': {
+      if (state.phase !== 'lobby') return { ok: false, error: 'Имя меняется только до начала игры.' };
+      p.name = cleanName(a.name);
+      state.rev++;
+      return { ok: true };
+    }
+
+    case 'kick': {
+      if (!isHost) return { ok: false, error: 'Только ведущий может убрать игрока.' };
+      if (state.phase !== 'lobby') return { ok: false, error: 'Убрать игрока можно только до начала игры.' };
+      const idx = state.players.findIndex((x) => x.pid === a.pid);
+      if (idx <= 0) return { ok: false, error: 'Нельзя убрать этого игрока.' };
+      const [gone] = state.players.splice(idx, 1);
+      log(state, `${gone.name} покидает комнату`);
+      state.rev++;
+      return { ok: true, kicked: gone.secret };
+    }
+
+    case 'start': {
+      if (!isHost) return { ok: false, error: 'Начать игру может только ведущий.' };
+      return startGame(state, caseData);
+    }
+
+    case 'play':
+    case 'archive': {
+      if (state.phase !== 'play') return { ok: false, error: 'Сейчас нельзя ходить.' };
+      if (state.players[state.turn] !== p) return { ok: false, error: 'Сейчас не ваш ход.' };
+      const i = p.hand.indexOf(a.cardId);
+      if (i < 0) return { ok: false, error: 'Этой карты нет у вас на руке.' };
+      const card = cardById(caseData, a.cardId);
+      if (a.type === 'play') {
+        if (!canPlayFaceUp(state, caseData, a.cardId)) {
+          return { ok: false, error: `Чтобы выложить эту карту, в архиве должно быть не меньше ${card.value} карт.` };
+        }
+        p.hand.splice(i, 1);
+        state.table.push({ id: card.id, by: p.pid, kind: 'played' });
+        log(state, `${p.name} выкладывает на стол «${card.title}»`);
+      } else {
+        p.hand.splice(i, 1);
+        state.archive.push({ id: card.id, by: p.pid });
+        log(state, `${p.name} отправляет карту «${card.title}» в архив`);
+      }
+      drawInto(state, caseData, p);
+      nextTurn(state);
+      state.rev++;
+      return { ok: true };
+    }
+
+    case 'skip': {
+      if (!isHost) return { ok: false, error: 'Пропустить чужой ход может только ведущий.' };
+      if (state.phase !== 'play') return { ok: false, error: 'Сейчас нельзя ходить.' };
+      const cur = state.players[state.turn];
+      if (cur.online) return { ok: false, error: 'Игрок в сети — пусть ходит сам.' };
+      log(state, `Ведущий пропускает ход игрока ${cur.name}: он не в сети`);
+      nextTurn(state);
+      state.rev++;
+      return { ok: true };
+    }
+
+    case 'answer': {
+      if (state.phase !== 'questions') return { ok: false, error: 'Вопросы ещё не открыты.' };
+      const q = caseData.questions.find((x) => x.id === a.q);
+      if (!q) return { ok: false, error: 'Нет такого вопроса.' };
+      const opt = Number(a.opt);
+      if (!Number.isInteger(opt) || opt < 0 || opt >= q.options.length) return { ok: false, error: 'Нет такого ответа.' };
+      if (state.answers[q.id] === opt) return { ok: true };
+      state.answers[q.id] = opt;
+      state.ready = {};
+      state.rev++;
+      return { ok: true };
+    }
+
+    case 'ready': {
+      if (state.phase !== 'questions') return { ok: false, error: 'Вопросы ещё не открыты.' };
+      if (a.value) {
+        const missing = caseData.questions.filter((q) => state.answers[q.id] === undefined);
+        if (missing.length) return { ok: false, error: 'Сначала ответьте на все вопросы.' };
+        state.ready[p.pid] = true;
+      } else {
+        delete state.ready[p.pid];
+      }
+      const voters = state.players.filter((x) => x.online);
+      if (voters.length && voters.every((x) => state.ready[x.pid])) finish(state, caseData);
+      state.rev++;
+      return { ok: true };
+    }
+
+    case 'reset': {
+      if (!isHost) return { ok: false, error: 'Начать заново может только ведущий.' };
+      state.phase = 'lobby';
+      state.deck = [];
+      state.table = [];
+      state.archive = [];
+      state.endDrawn = false;
+      state.answers = {};
+      state.ready = {};
+      state.result = null;
+      state.log = [];
+      for (const x of state.players) x.hand = [];
+      log(state, 'Ведущий вернул всех в комнату ожидания');
+      state.rev++;
+      return { ok: true };
+    }
+
+    default:
+      return { ok: false, error: 'Неизвестное действие.' };
+  }
+}
+
+export function score(caseData, answers) {
+  let total = 0;
+  let max = 0;
+  const perQ = caseData.questions.map((q) => {
+    max += q.points;
+    const ok = answers[q.id] === q.correct;
+    if (ok) total += q.points;
+    return { id: q.id, ok, points: ok ? q.points : 0 };
+  });
+  const rank = caseData.ranks.find((r) => total >= r.min) || caseData.ranks[caseData.ranks.length - 1];
+  return { total, max, perQ, rank: { title: rank.title, text: rank.text } };
+}
+
+function finish(state, caseData) {
+  state.result = score(caseData, state.answers);
+  state.phase = 'result';
+  log(state, `Доклад сдан: ${state.result.total} из ${state.result.max} очков`);
+}
+
+// Что видит конкретный игрок. Чужие руки — только названия и числа (их по правилам можно назвать вслух).
+export function viewFor(state, caseData, secret) {
+  const me = player(state, secret);
+  const reveal = state.phase === 'result';
+  return {
+    rev: state.rev,
+    caseId: state.caseId,
+    phase: state.phase,
+    me: me ? me.pid : null,
+    isHost: secret === state.hostSecret,
+    hostPid: state.players[0]?.pid,
+    players: state.players.map((p) => ({
+      pid: p.pid,
+      name: p.name,
+      online: p.online,
+      handCount: p.hand.length,
+      handTitles: p === me ? [] : p.hand.map((id) => {
+        const c = cardById(caseData, id);
+        return { title: c.title, value: c.value ?? 0 };
+      }),
+    })),
+    hand: me ? [...me.hand] : [],
+    table: state.table.map((t) => ({ ...t })),
+    archiveCount: state.archive.length,
+    archive: reveal ? state.archive.map((a) => ({ ...a })) : null,
+    deckCount: state.deck.length,
+    turnPid: state.phase === 'play' ? state.players[state.turn]?.pid : null,
+    endDrawn: state.endDrawn,
+    log: state.log.slice(-60),
+    chat: state.chat.slice(-60),
+    answers: { ...state.answers },
+    ready: { ...state.ready },
+    result: state.result,
+  };
+}
+
+export { nameOf };
