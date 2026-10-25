@@ -1,9 +1,6 @@
-import nightExpress from './cases/night-express.js';
+import { CASES, CASE_LIST, DEFAULT_CASE, DIFFICULTY } from './cases/index.js';
 import * as E from './engine.js';
 import { hostNet, clientNet, DEFAULT_BROKER } from './net.js';
-
-const CASES = { [nightExpress.id]: nightExpress };
-const DEFAULT_CASE = nightExpress;
 
 const app = document.getElementById('app');
 const params = new URLSearchParams(location.search);
@@ -135,6 +132,13 @@ function startClient(room, name) {
 function act(action) {
   if (!session) return;
   if (session.role === 'host') {
+    if (action.type === 'case') {
+      if (!CASES[action.caseId]) return;
+      const r = E.setCase(hostState, action.caseId);
+      if (!r.ok) { toast(r.error); return; }
+      broadcast();
+      return;
+    }
     const res = E.applyAction(hostState, caseOf(hostState), secret, action);
     if (!res.ok) { toast(res.error); return; }
     if (res.kicked) net.send(res.kicked, { t: 'rejected', msg: 'Ведущий убрал вас из комнаты.' });
@@ -213,14 +217,13 @@ function brand() {
 function renderHome() {
   const room = (params.get('room') || '').toUpperCase();
   const name = store.get('dg.name', '');
-  const cd = DEFAULT_CASE;
   app.innerHTML = `
     <main class="home">
       ${brand()}
       <section class="hero">
-        <p class="eyebrow">Кооперативный детектив · ${esc(cd.players)} игроков · ~${cd.minutes} минут</p>
-        <h1>${esc(cd.title)}</h1>
-        <p class="lead">${esc(cd.subtitle)}. Соберите улики по карточкам, не показывая их друг другу, и вместе раскройте убийство в спальном вагоне.</p>
+        <p class="eyebrow">Кооперативный детектив · 1–6 игроков</p>
+        <h1>Раскройте дело вместе</h1>
+        <p class="lead">Соберите улики по карточкам, не показывая их друг другу, и ответьте на вопросы следователя. ${CASE_LIST.length} ${plural(CASE_LIST.length, 'дело', 'дела', 'дел')} — от лёгкого до очень сложного.</p>
       </section>
       ${ui.homeError ? `<p class="alert">${esc(ui.homeError)}</p>` : ''}
       <form class="box" id="home-form" autocomplete="off">
@@ -326,9 +329,11 @@ function renderLobby() {
         </ul>
       </section>
       <section class="box">
-        <p class="eyebrow">Дело</p>
-        <h2>${esc(cd.title)}</h2>
-        <p class="hint">${esc(cd.subtitle)}</p>
+        <p class="eyebrow">${isHost ? 'Выберите дело' : 'Дело'}</p>
+        ${isHost
+          ? `<div class="cases">${CASE_LIST.map((c) => caseTile(c, { selected: c.id === cd.id, button: true })).join('')}</div>
+             <p class="hint">Каждое дело можно сыграть один раз: второй раз оно уже не загадка.</p>`
+          : caseTile(cd, { selected: true })}
       </section>
       ${!ui.hostOnline && !isHost ? `<p class="alert">Ведущий не в сети. Ждём его возвращения…</p>` : ''}
       ${isHost
@@ -342,9 +347,10 @@ function renderLobby() {
     </main>`;
   renderStatus();
   app.onclick = (e) => {
-    const b = e.target.closest('[data-act],[data-kick]');
+    const b = e.target.closest('[data-act],[data-kick],[data-case]');
     if (!b) return;
     if (b.dataset.kick) return act({ type: 'kick', pid: b.dataset.kick });
+    if (b.dataset.case) return act({ type: 'case', caseId: b.dataset.case });
     const a = b.dataset.act;
     if (a === 'start') act({ type: 'start' });
     if (a === 'rules') openRules();
@@ -352,6 +358,25 @@ function renderLobby() {
     if (a === 'copy') copyInvite();
     if (a === 'share') shareInvite();
   };
+}
+
+function difficultyBadge(level) {
+  const d = DIFFICULTY[level] || DIFFICULTY[1];
+  const pips = [1, 2, 3, 4].map((i) => `<i class="${i <= level ? 'on' : ''}"></i>`).join('');
+  return `<span class="diff diff--${level}" title="${esc(d.hint)}"><span class="pips" aria-hidden="true">${pips}</span>${esc(d.label)}</span>`;
+}
+
+function caseTile(c, { selected, button } = {}) {
+  const done = store.get('dg.done', {})[c.id];
+  const tag = button ? 'button' : 'div';
+  return `
+    <${tag} class="case ${selected ? 'case--on' : ''}" ${button ? `data-case="${esc(c.id)}" aria-pressed="${selected}"` : ''}>
+      <span class="case__top">${difficultyBadge(c.difficulty)}<span class="case__meta">~${c.minutes} мин</span></span>
+      <span class="case__title">${esc(c.title)}</span>
+      <span class="case__sub">${esc(c.subtitle)}</span>
+      <span class="case__blurb">${esc(c.blurb)}</span>
+      ${done ? `<span class="case__done">Вы уже раскрыли это дело: ${done.total} из ${done.max}</span>` : ''}
+    </${tag}>`;
 }
 
 async function copyInvite() {
@@ -582,49 +607,33 @@ function revealedMarks(cd) {
   return marks;
 }
 
+function shapeSvg(sh, marks) {
+  if (sh.when && !marks.includes(sh.when)) return '';
+  if (sh.t === 'rect') return `<rect x="${sh.x}" y="${sh.y}" width="${sh.w}" height="${sh.h}" class="m-${sh.c}"/>`;
+  if (sh.t === 'line') return `<line x1="${sh.x1}" y1="${sh.y1}" x2="${sh.x2}" y2="${sh.y2}" class="m-${sh.c}"/>`;
+  if (sh.t === 'text') return `<text x="${sh.x}" y="${sh.y}" class="m-t m-${sh.c}">${esc(sh.s)}</text>`;
+  return '';
+}
+
 function renderMap(cd) {
   const el = document.getElementById('p-map');
+  const map = cd.map;
   const marks = revealedMarks(cd);
-  const pts = cd.map.points;
-  const showNames = marks.some((m) => pts[m].names);
-  const showPlatform = marks.some((m) => pts[m].platform);
+  const pts = map.points;
   const pins = marks.filter((m) => pts[m].x != null);
-  const rooms = cd.map.rooms;
-
-  const compartments = rooms.map((name, i) => {
-    const x = 190 + i * 120;
-    return `
-      <rect x="${x}" y="100" width="120" height="170" class="m-room"/>
-      <rect x="${x + 35}" y="266" width="50" height="8" class="m-win"/>
-      <rect x="${x + 40}" y="96" width="40" height="8" class="m-door"/>
-      <text x="${x + 60}" y="132" class="m-num">${i + 1}</text>
-      ${showNames ? `<text x="${x + 60}" y="158" class="m-name">${esc(name)}</text>` : ''}`;
-  }).join('');
-
-  const corridorWins = Array.from({ length: 8 }, (_, i) => `<rect x="${60 + i * 120}" y="36" width="50" height="8" class="m-win"/>`).join('');
+  const infos = marks.filter((m) => pts[m].x == null);
 
   el.innerHTML = `
-    <h2 class="section-title">Схема вагона № 4</h2>
+    <h2 class="section-title">${esc(map.title)}</h2>
     <div class="map">
-      <svg viewBox="0 0 1000 300" role="img" aria-label="Схема спального вагона">
-        ${showPlatform ? `<rect x="10" y="4" width="980" height="22" class="m-platform"/><text x="500" y="20" class="m-plabel">ПЕРРОН В ЛОЗОВОЙ</text>` : ''}
-        <rect x="10" y="40" width="980" height="230" class="m-wagon"/>
-        ${corridorWins}
-        <text x="560" y="76" class="m-label">коридор</text>
-        <rect x="10" y="100" width="120" height="170" class="m-room"/>
-        <text x="70" y="180" class="m-label">служебное</text>
-        <rect x="130" y="100" width="60" height="170" class="m-room m-room--stove"/>
-        <text x="160" y="150" class="m-label m-small">печь</text>
-        ${compartments}
-        <rect x="910" y="100" width="80" height="170" class="m-room"/>
-        <text x="950" y="140" class="m-label m-small">уборная</text>
-        <text x="500" y="292" class="m-caption">окна купе</text>
+      <svg viewBox="0 0 ${map.width} ${map.height}" role="img" aria-label="${esc(map.title)}">
+        ${map.shapes.map((sh) => shapeSvg(sh, marks)).join('')}
         ${pins.map((m, i) => `<g class="m-pin"><circle cx="${pts[m].x}" cy="${pts[m].y}" r="14"/><text x="${pts[m].x}" y="${pts[m].y + 5}">${i + 1}</text></g>`).join('')}
       </svg>
     </div>
     ${marks.length ? `<ol class="legend">
       ${pins.map((m, i) => `<li><span class="pin">${i + 1}</span>${esc(pts[m].label)}</li>`).join('')}
-      ${marks.filter((m) => pts[m].x == null).map((m) => `<li><span class="pin pin--info">i</span>${esc(pts[m].label)}</li>`).join('')}
+      ${infos.map((m) => `<li><span class="pin pin--info">i</span>${esc(pts[m].label)}</li>`).join('')}
     </ol>` : `<p class="empty">Детали появятся на схеме, когда на стол лягут карты места преступления.</p>`}`;
 }
 
@@ -666,6 +675,11 @@ function renderQuestions(cd) {
 function renderResult(cd) {
   const el = document.getElementById('p-hand');
   const r = view.result;
+  const done = store.get('dg.done', {});
+  if (!done[cd.id] || done[cd.id].total < r.total) {
+    done[cd.id] = { total: r.total, max: r.max };
+    store.set('dg.done', done);
+  }
   el.innerHTML = `
     <section class="result">
       <p class="eyebrow">Итог расследования</p>
@@ -715,7 +729,7 @@ function openRules() {
           </ul>
         </li>
         <li>После хода вы берёте новую карту из колоды. <b>Повороты сюжета</b> открываются сразу всем.</li>
-        <li>Карты места преступления отмечают детали на <b>схеме вагона</b>.</li>
+        <li>Карты места преступления отмечают детали на <b>схеме места преступления</b>.</li>
         <li>Когда придёт карта <b>«Дело закрыто»</b>, колода кончилась. Доиграйте карты с рук.</li>
         <li>В конце все вместе отвечают на вопросы. Когда все нажмут «Готовы», вы узнаете счёт и разгадку.</li>
       </ol>

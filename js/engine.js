@@ -40,6 +40,15 @@ export function createGame(caseData, host) {
   return state;
 }
 
+// Смена дела в комнате ожидания. Проверку, что дело существует, делает вызывающий код.
+export function setCase(state, caseId) {
+  if (state.phase !== 'lobby') return { ok: false, error: 'Дело можно сменить только до начала игры.' };
+  if (state.caseId === caseId) return { ok: true };
+  state.caseId = caseId;
+  state.rev++;
+  return { ok: true };
+}
+
 function player(state, secret) {
   return state.players.find((p) => p.secret === secret);
 }
