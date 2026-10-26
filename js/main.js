@@ -53,6 +53,18 @@ function plural(n, one, few, many) {
   return many;
 }
 
+function setNetStatus(s) {
+  const was = ui.netStatus;
+  ui.netStatus = s;
+  if (s === 'online') { clearTimeout(ui.netTimer); ui.netBad = false; }
+  else if (was === 'online' || !ui.netTimer) {
+    clearTimeout(ui.netTimer);
+    ui.netTimer = setTimeout(() => { if (ui.netStatus !== 'online') { ui.netBad = true; render(); } }, 3000);
+  }
+  renderStatus();
+  if (s === 'online') render();
+}
+
 let toastTimer = null;
 function toast(text) {
   const el = document.getElementById('toast');
@@ -72,12 +84,23 @@ function startHost(room, state) {
     url: BROKER,
     room,
     secret,
-    onStatus: (s) => { ui.netStatus = s; renderStatus(); },
-    onPresence: (s, online) => { if (E.setOnline(hostState, s, online)) broadcast(); },
+    onStatus: setNetStatus,
+    onPresence: (s, online) => { if (E.setOnline(hostState, s, online, caseOf(hostState))) broadcast(); },
     onMessage: (from, msg) => {
       if (msg.t === 'hello') {
+        const known = hostState.players.some((p) => p.secret === from);
+        if (!known && hostState.phase !== 'lobby') {
+          // Игра идёт, а устройство незнакомое: предлагаем вернуться на своё место.
+          net.send(from, { t: 'seats', seats: E.seatsFor(hostState) });
+          return;
+        }
         const res = E.addPlayer(hostState, { secret: from, name: msg.name });
         if (!res.ok) net.send(from, { t: 'rejected', msg: res.error });
+        broadcast();
+      } else if (msg.t === 'claim') {
+        const res = E.claimSeat(hostState, caseOf(hostState), from, msg.pid);
+        if (!res.ok) { net.send(from, { t: 'seats', seats: E.seatsFor(hostState), msg: res.error }); return; }
+        net.forget(res.oldSecret);
         broadcast();
       } else if (msg.t === 'act') {
         const res = E.applyAction(hostState, caseOf(hostState), from, msg.action);
@@ -114,11 +137,19 @@ function startClient(room, name) {
     room,
     secret,
     name,
-    onStatus: (s) => { ui.netStatus = s; renderStatus(); },
+    onStatus: setNetStatus,
     onHost: (online) => { ui.hostOnline = online; render(); },
     onMessage: (msg) => {
       if (msg.t === 'state') {
+        ui.seats = null;
+        clearInterval(ui.seatsTimer);
         if (!view || msg.view.rev >= view.rev || msg.view.phase !== view.phase) setView(msg.view);
+      } else if (msg.t === 'seats') {
+        if (view) return;
+        ui.seats = { list: msg.seats, msg: msg.msg || '' };
+        clearInterval(ui.seatsTimer);
+        ui.seatsTimer = setInterval(() => net?.hello(), 4000);
+        render();
       } else if (msg.t === 'error') {
         toast(msg.msg);
       } else if (msg.t === 'rejected') {
@@ -168,6 +199,8 @@ function leave(message) {
   if (session?.role === 'host') store.del('dg.host.' + session.room);
   store.del('dg.session');
   net = null; session = null; view = null; hostState = null;
+  ui.seats = null;
+  clearInterval(ui.seatsTimer);
   ui.homeError = message || '';
   clearTimeout(ui.joinTimer);
   history.replaceState(null, '', location.pathname + (params.get('broker') ? '?broker=' + encodeURIComponent(BROKER) : ''));
@@ -182,10 +215,27 @@ function inviteLink() {
   return u.toString();
 }
 
+// ---------- экран не гаснет во время игры ----------
+// Когда телефон засыпает, браузер рвёт соединение. Просим не гасить экран, пока открыта игра.
+let wakeLock = null;
+async function keepAwake() {
+  if (!session || wakeLock || document.visibilityState !== 'visible' || !navigator.wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (_) { /* браузер не разрешил — не страшно */ }
+}
+function letSleep() {
+  try { wakeLock?.release(); } catch (_) { /* уже отпущен */ }
+  wakeLock = null;
+}
+document.addEventListener('visibilitychange', keepAwake);
+
 // ---------- отрисовка ----------
 function render() {
+  if (session) keepAwake(); else letSleep();
   let screen = 'home';
-  if (session && !view) screen = 'connecting';
+  if (session && !view) screen = ui.seats ? 'seats' : 'connecting';
   else if (view?.phase === 'lobby') screen = 'lobby';
   else if (view) screen = 'game';
 
@@ -196,6 +246,7 @@ function render() {
   }
   if (screen === 'home') renderHome();
   else if (screen === 'connecting') renderConnecting();
+  else if (screen === 'seats') renderSeats();
   else if (screen === 'lobby') renderLobby();
   else renderGame();
 }
@@ -291,12 +342,48 @@ function renderConnecting() {
   app.querySelector('[data-act="back"]').onclick = () => leave();
 }
 
+function renderSeats() {
+  const list = ui.seats.list;
+  app.innerHTML = `
+    <main class="home">
+      <header class="topline">${brand()}<span id="net" class="net"></span></header>
+      <section class="box">
+        <p class="eyebrow">Комната ${esc(session.room)}</p>
+        <h2>Игра уже идёт</h2>
+        <p class="hint">Если вы вылетели, выберите себя — вернётесь на своё место со своими картами. Занять можно только место игрока, который сейчас не в сети.</p>
+        ${ui.seats.msg ? `<p class="alert">${esc(ui.seats.msg)}</p>` : ''}
+        <div class="seats">
+          ${list.map((p) => {
+            const can = !p.online && !p.host;
+            return `<button class="seat" data-claim="${esc(p.pid)}" ${can ? '' : 'disabled'}>
+              <span class="dot ${p.online ? '' : 'dot--off'}"></span>
+              <span class="seat__name">${esc(p.name)}</span>
+              <span class="seat__state">${p.host ? 'ведущий' : p.online ? 'в сети' : 'это я'}</span>
+            </button>`;
+          }).join('')}
+        </div>
+        <p class="hint">Если ваше имя ещё «в сети», подождите минуту: старое подключение отвалится само.</p>
+      </section>
+      <button class="link" data-act="back">Назад</button>
+    </main>`;
+  renderStatus();
+  app.onclick = (e) => {
+    const b = e.target.closest('[data-claim],[data-act]');
+    if (!b) return;
+    if (b.dataset.claim) {
+      const p = list.find((x) => x.pid === b.dataset.claim);
+      if (p && confirm(`Вернуться в игру как ${p.name}?`)) net.claim(p.pid);
+    }
+    if (b.dataset.act === 'back') leave();
+  };
+}
+
 function playerChips() {
   return view.players.map((p) => {
     const turn = p.pid === view.turnPid;
     return `<li class="chip ${turn ? 'chip--turn' : ''} ${p.online ? '' : 'chip--off'}">
       <span class="dot" title="${p.online ? 'в сети' : 'не в сети'}"></span>
-      <span class="chip__name">${esc(p.name)}${p.pid === view.me ? ' <small>(вы)</small>' : ''}${p.pid === view.hostPid ? ' <small>★</small>' : ''}</span>
+      <span class="chip__name">${esc(p.name)}${p.pid === view.me ? ' <small>(вы)</small>' : ''}${p.pid === view.hostPid ? ' <small>★</small>' : ''}${p.left ? ' <small>вне игры</small>' : ''}</span>
       ${view.phase === 'play' ? `<span class="chip__count" title="Карт на руке">${p.handCount}</span>` : ''}
     </li>`;
   }).join('');
@@ -459,7 +546,7 @@ function ensureGameSkeleton() {
   });
 
   app.onclick = (e) => {
-    const b = e.target.closest('[data-act],[data-tab],[data-play],[data-archive],[data-confirm],[data-answer]');
+    const b = e.target.closest('[data-act],[data-tab],[data-play],[data-archive],[data-confirm],[data-answer],[data-drop]');
     if (!b) return;
     if (b.dataset.tab) { ui.tab = b.dataset.tab; renderGame(); window.scrollTo({ top: 0 }); return; }
     if (b.dataset.play) { act({ type: 'play', cardId: b.dataset.play }); ui.confirmArchive = null; return; }
@@ -479,6 +566,11 @@ function ensureGameSkeleton() {
     if (a === 'rules') openRules();
     if (a === 'leave') confirmLeave();
     if (a === 'skip') act({ type: 'skip' });
+    if (a === 'reconnect') net?.restart();
+    if (b.dataset.drop) {
+      const p = view.players.find((x) => x.pid === b.dataset.drop);
+      if (p && confirm(`Раздать карты игрока ${p.name} остальным? Если игрок вернётся, то доберёт новые карты из колоды.`)) act({ type: 'drop', pid: p.pid });
+    }
     if (a === 'ready') act({ type: 'ready', value: !view.ready[view.me] });
     if (a === 'reset' && confirm('Вернуть всех в комнату ожидания? Текущая партия закончится.')) act({ type: 'reset' });
   };
@@ -500,17 +592,30 @@ function renderGame() {
   // баннер хода
   const banner = document.getElementById('banner');
   let b = '';
-  if (!ui.hostOnline && !view.isHost) b = `<div class="banner banner--bad">Ведущий не в сети. Ждём его возвращения…</div>`;
+  if (ui.netBad) b += `<div class="banner banner--bad"><span>Нет связи. Переподключаемся…</span><button class="btn btn--small" data-act="reconnect">Переподключить</button></div>`;
+  if (!ui.hostOnline && !view.isHost) b += `<div class="banner banner--bad">Ведущий не в сети. Ждём его возвращения: игра продолжится с того же места.</div>`;
   else if (view.phase === 'play') {
     const cur = view.players.find((p) => p.pid === view.turnPid);
     if (view.turnPid === view.me) {
-      b = `<div class="banner banner--me"><span>Ваш ход: выложите карту на стол или отправьте в архив</span>${ui.tab !== 'hand' ? '<button class="btn btn--small" data-tab="hand">К картам</button>' : ''}</div>`;
+      b += `<div class="banner banner--me"><span>Ваш ход: выложите карту на стол или отправьте в архив</span>${ui.tab !== 'hand' ? '<button class="btn btn--small" data-tab="hand">К картам</button>' : ''}</div>`;
+    } else if (cur && cur.online) {
+      b += `<div class="banner"><span>Ходит <b>${esc(cur.name)}</b></span></div>`;
     } else if (cur) {
-      b = `<div class="banner"><span>Ходит <b>${esc(cur.name)}</b>${cur.online ? '' : ' — не в сети'}</span>${!cur.online && view.isHost ? '<button class="btn btn--small" data-act="skip">Пропустить ход</button>' : ''}</div>`;
+      b += `<div class="banner banner--warn"><span>Ходит <b>${esc(cur.name)}</b>, но сейчас не в сети. ${view.isHost
+        ? 'Можно подождать или раздать карты этого игрока остальным.'
+        : 'Ждём возвращения. Ведущий может раздать карты этого игрока остальным.'}</span>
+        ${view.isHost ? `<span class="row"><button class="btn btn--small" data-act="skip">Пропустить ход</button><button class="btn btn--small btn--danger" data-drop="${esc(cur.pid)}">Раздать карты</button></span>` : ''}
+      </div>`;
+    }
+    if (view.isHost) {
+      const away = view.players.filter((p) => !p.online && p.handCount && p.pid !== view.turnPid);
+      for (const p of away) {
+        b += `<div class="banner banner--warn"><span><b>${esc(p.name)}</b> не в сети, на руке ${p.handCount} ${plural(p.handCount, 'карта', 'карты', 'карт')}.</span><button class="btn btn--small btn--danger" data-drop="${esc(p.pid)}">Раздать карты</button></div>`;
+      }
     }
     if (view.endDrawn) b += `<div class="banner banner--end">Колода закончилась. Доиграйте карты с рук</div>`;
   } else if (view.phase === 'questions') {
-    b = `<div class="banner banner--me"><span>Все карты сыграны. Ответьте вместе на вопросы следователя</span>${ui.tab !== 'hand' ? '<button class="btn btn--small" data-tab="hand">К докладу</button>' : ''}</div>`;
+    b += `<div class="banner banner--me"><span>Все карты сыграны. Ответьте вместе на вопросы следователя</span>${ui.tab !== 'hand' ? '<button class="btn btn--small" data-tab="hand">К докладу</button>' : ''}</div>`;
   }
   banner.innerHTML = b;
 
@@ -733,6 +838,7 @@ function openRules() {
         <li>Когда придёт карта <b>«Дело закрыто»</b>, колода кончилась. Доиграйте карты с рук.</li>
         <li>В конце все вместе отвечают на вопросы. Когда все нажмут «Готовы», вы узнаете счёт и разгадку.</li>
       </ol>
+      <p><b>Если кто-то вылетел</b>, пусть снова откроет ссылку на игру. С того же телефона он вернётся сразу, с другого — выберет своё имя в списке. Если игрок не возвращается, ведущий может раздать его карты остальным и доиграть без него.</p>
       <p class="hint">Записывать улики нельзя — полагайтесь на память. Обсуждать выложенные карты можно в чате или голосом. Игра одноразовая: второй раз дело уже не загадка.</p>
       <button class="btn btn--primary">Понятно</button>
     </form>`;

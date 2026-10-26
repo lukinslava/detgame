@@ -63,6 +63,12 @@ function log(state, text) {
   if (state.log.length > LOG_LIMIT) state.log.splice(0, state.log.length - LOG_LIMIT);
 }
 
+function cardsWord(n) {
+  const m10 = n % 10, m100 = n % 100;
+  const w = m10 === 1 && m100 !== 11 ? 'карта' : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? 'карты' : 'карт';
+  return `${n} ${w}`;
+}
+
 function cleanName(name) {
   const s = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 24);
   return s || 'Сыщик';
@@ -87,12 +93,57 @@ export function addPlayer(state, { secret, name }) {
   return { ok: true, player: p };
 }
 
-export function setOnline(state, secret, online) {
+export function setOnline(state, secret, online, caseData) {
   const p = player(state, secret);
   if (!p || p.online === online) return false;
   p.online = online;
+  if (online && caseData) comeBack(state, caseData, p);
   state.rev++;
   return true;
+}
+
+// Игрок вернулся. Если его карты успели раздать остальным, а колода не кончилась, —
+// добираем ему руку, чтобы он снова мог ходить.
+function comeBack(state, caseData, p) {
+  if (!p.left) return;
+  p.left = false;
+  log(state, `${p.name} возвращается в игру`);
+  if (state.phase !== 'play') return;
+  const size = HAND_SIZE[state.players.length];
+  while (p.hand.length < size && state.deck.length && !state.endDrawn) {
+    const before = p.hand.length;
+    drawInto(state, caseData, p);
+    if (p.hand.length === before) break;
+  }
+  if (state.players[state.turn]?.hand.length === 0) advanceIfStuck(state);
+}
+
+// Игрок вылетел и зашёл с другого устройства или браузера: занимает своё прежнее место.
+// Занять можно только место игрока, который сейчас не в сети.
+export function claimSeat(state, caseData, newSecret, pid) {
+  if (state.phase === 'lobby') return { ok: false, error: 'Игра ещё не началась — просто войдите в комнату.' };
+  if (player(state, newSecret)) return { ok: false, error: 'Вы уже в игре.' };
+  const p = state.players.find((x) => x.pid === pid);
+  if (!p) return { ok: false, error: 'Такого игрока нет.' };
+  if (p.secret === state.hostSecret) return { ok: false, error: 'Место ведущего занять нельзя.' };
+  if (p.online) return { ok: false, error: `${p.name} сейчас в сети. Если это вы на старом устройстве — подождите минуту, пока оно отключится, и попробуйте снова.` };
+  const oldSecret = p.secret;
+  p.secret = newSecret;
+  p.online = true;
+  log(state, `${p.name} возвращается с другого устройства`);
+  comeBack(state, caseData, p);
+  state.rev++;
+  return { ok: true, oldSecret, player: p };
+}
+
+// Места, которые можно занять при возвращении.
+export function seatsFor(state) {
+  return state.players.map((p) => ({
+    pid: p.pid,
+    name: p.name,
+    online: p.online,
+    host: p.secret === state.hostSecret,
+  }));
 }
 
 // Берём карты сверху колоды, пока не попадётся обычная карта.
@@ -241,6 +292,28 @@ export function applyAction(state, caseData, secret, action) {
       return { ok: true };
     }
 
+    case 'drop': {
+      if (!isHost) return { ok: false, error: 'Раздать чужие карты может только ведущий.' };
+      if (state.phase !== 'play') return { ok: false, error: 'Сейчас это не нужно.' };
+      const idx = state.players.findIndex((x) => x.pid === a.pid);
+      const gone = state.players[idx];
+      if (!gone || gone.secret === state.hostSecret) return { ok: false, error: 'Нельзя убрать этого игрока.' };
+      if (gone.online) return { ok: false, error: `${gone.name} в сети — пусть ходит сам.` };
+      const others = [];
+      for (let i = 1; i < state.players.length; i++) {
+        const x = state.players[(idx + i) % state.players.length];
+        if (!x.left) others.push(x);
+      }
+      const cards = gone.hand.splice(0);
+      cards.forEach((id, i) => others[i % others.length].hand.push(id));
+      gone.left = true;
+      log(state, `${gone.name} выходит из партии. ${cardsWord(cards.length)} с руки ${cards.length === 1 ? 'передана' : 'розданы'} остальным`);
+      if (state.players[state.turn] === gone) nextTurn(state);
+      else advanceIfStuck(state);
+      state.rev++;
+      return { ok: true };
+    }
+
     case 'answer': {
       if (state.phase !== 'questions') return { ok: false, error: 'Вопросы ещё не открыты.' };
       const q = caseData.questions.find((x) => x.id === a.q);
@@ -325,6 +398,7 @@ export function viewFor(state, caseData, secret) {
       pid: p.pid,
       name: p.name,
       online: p.online,
+      left: !!p.left,
       handCount: p.hand.length,
       handTitles: p === me ? [] : p.hand.map((id) => {
         const c = cardById(caseData, id);
