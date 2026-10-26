@@ -23,6 +23,8 @@ function topics(room) {
     presence: (secret, conn) => base + '/presence/' + secret + '/' + conn,
     presenceAll: base + '/presence/+/+',
     player: (secret) => base + '/p/' + secret,
+    epoch: base + '/epoch',
+    backup: base + '/backup',
   };
 }
 
@@ -58,12 +60,13 @@ function tracker(onChange) {
       confirmed = null;
     }, 2500);
   }
-  return { seen, resync, alive };
+  const has = (key, conn) => !!map.get(key)?.has(conn);
+  return { seen, resync, alive, has };
 }
 
 // Подключение, которое умеет полностью пересоздаваться: после сна телефона
 // старый сокет часто «жив» только на словах, и ждать таймаута долго.
-function resilient({ url, presenceTopic, onConnect, onMessage, onStatus }) {
+function resilient({ url, presenceTopic, topics: subs, onBeforeSubscribe, onConnect, onMessage, onStatus }) {
   let client = null;
   let conn = null;
   let hiddenAt = 0;
@@ -84,8 +87,13 @@ function resilient({ url, presenceTopic, onConnect, onMessage, onStatus }) {
     c.on('connect', () => {
       if (c !== client) return;
       onStatus?.('online');
-      c.publish(topic, 'online', { retain: true, qos: 1 });
-      onConnect(c);
+      // Сначала подписываемся, потом объявляем себя в сети: иначе первые сообщения потеряются.
+      onBeforeSubscribe?.();
+      c.subscribe(subs, { qos: 1 }, () => {
+        if (c !== client) return;
+        c.publish(topic, 'online', { retain: true, qos: 1 });
+        onConnect?.(c);
+      });
     });
     c.on('close', () => {
       if (c !== client || closed) return;
@@ -138,22 +146,27 @@ function resilient({ url, presenceTopic, onConnect, onMessage, onStatus }) {
 }
 
 // Ведущий. onMessage(secret, msg) — пришло от игрока; onPresence(secret, online).
-export function hostNet({ url, room, secret, onMessage, onPresence, onStatus }) {
+export function hostNet({ url, room, secret, onMessage, onPresence, onStatus, onEpoch, onReady }) {
   const t = topics(room);
   const people = tracker((who, online) => onPresence(who, online));
 
   const link = resilient({
     url,
     presenceTopic: (conn) => t.hostConn(conn),
+    topics: [t.toHost, t.presenceAll, t.epoch],
     onStatus,
-    onConnect: (c) => {
-      people.resync();
-      c.subscribe([t.toHost, t.presenceAll], { qos: 1 });
-    },
+    onBeforeSubscribe: () => people.resync(),
+    // Сначала узнаём, не сменился ли ведущий, пока нас не было, и только потом рассылаем.
+    onConnect: () => setTimeout(() => onReady?.(), 2000),
     onMessage: (topic, payload) => {
       if (topic === t.toHost) {
         const msg = parse(payload);
         if (msg && typeof msg.secret === 'string' && msg.secret !== secret) onMessage(msg.secret, msg);
+        return;
+      }
+      if (topic === t.epoch) {
+        const msg = parse(payload);
+        if (msg) onEpoch?.(msg);
         return;
       }
       const m = topic.match(/\/presence\/([^/]+)\/([^/]+)$/);
@@ -165,6 +178,12 @@ export function hostNet({ url, room, secret, onMessage, onPresence, onStatus }) 
   return {
     send(toSecret, msg, retain = false) {
       link.publish(t.player(toSecret), JSON.stringify(msg), { qos: 1, retain });
+    },
+    announce(epoch) {
+      link.publish(t.epoch, JSON.stringify(epoch), { qos: 1, retain: true });
+    },
+    backup(data) {
+      link.publish(t.backup, JSON.stringify(data), { qos: 1, retain: true });
     },
     // Стереть сохранённое состояние для устройства, которое больше не в игре.
     forget(oldSecret) {
@@ -180,6 +199,7 @@ export function hostNet({ url, room, secret, onMessage, onPresence, onStatus }) 
 export function clientNet({ url, room, secret, name, onMessage, onHost, onStatus }) {
   const t = topics(room);
   let link = null;
+  const backupWaiters = [];
   const host = tracker((_, online) => {
     onHost(online);
     if (online) hello();
@@ -191,15 +211,24 @@ export function clientNet({ url, room, secret, name, onMessage, onHost, onStatus
   link = resilient({
     url,
     presenceTopic: (conn) => t.presence(secret, conn),
+    topics: [t.player(secret), t.hostAll],
     onStatus,
-    onConnect: (c) => {
-      host.resync();
-      c.subscribe([t.player(secret), t.hostAll], { qos: 1 }, () => hello());
-    },
+    onBeforeSubscribe: () => host.resync(),
+    onConnect: () => hello(),
     onMessage: (topic, payload) => {
       const hm = topic.match(/\/host\/([^/]+)$/);
       if (hm) {
-        host.seen('host', hm[1], decode(payload) === 'online');
+        const online = decode(payload) === 'online';
+        const fresh = online && !host.has('host', hm[1]);
+        host.seen('host', hm[1], online);
+        // Появилось новое подключение ведущего (возможно, это уже другой человек) — представимся.
+        if (fresh) hello();
+        return;
+      }
+      if (topic === t.backup) {
+        const data = payload.length ? parse(payload) : null;
+        const w = backupWaiters.splice(0);
+        w.forEach((fn) => fn(data));
         return;
       }
       if (!payload.length) return;
@@ -211,6 +240,24 @@ export function clientNet({ url, room, secret, name, onMessage, onHost, onStatus
   return {
     act: (action) => send({ t: 'act', action }),
     claim: (pid) => send({ t: 'claim', pid }),
+    // Прочитать резервную копию партии, которую держит брокер.
+    fetchBackup(timeoutMs = 6000) {
+      return new Promise((resolve) => {
+        const c = link.client;
+        const done = (data) => {
+          clearTimeout(timer);
+          c.unsubscribe(t.backup);
+          resolve(data);
+        };
+        const timer = setTimeout(() => {
+          const i = backupWaiters.indexOf(done);
+          if (i >= 0) backupWaiters.splice(i, 1);
+          done(null);
+        }, timeoutMs);
+        backupWaiters.push(done);
+        c.subscribe(t.backup, { qos: 1 });
+      });
+    },
     hello,
     restart: () => link.restart(),
     close: () => link.close(),

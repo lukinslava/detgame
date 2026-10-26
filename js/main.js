@@ -74,55 +74,165 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
 }
 
+// ---------- отпечаток секрета ----------
+// В резервную копию партии кладём не секреты игроков, а их отпечатки:
+// по ним новый ведущий узнаёт вернувшихся, но сам секрет из копии не достать.
+const hashCache = new Map();
+async function hashOf(s) {
+  const key = session.room + ':' + s;
+  if (hashCache.has(key)) return hashCache.get(key);
+  let hex;
+  try {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key));
+    hex = Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+  } catch (_) {
+    // Нет crypto.subtle (страница открыта не по https) — простой, но стабильный хеш.
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < key.length; i++) {
+      const ch = key.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    hex = 'f' + (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16);
+  }
+  hashCache.set(key, hex);
+  return hex;
+}
+
+async function ensureHashes() {
+  for (const p of hostState?.players || []) {
+    if (p.secret && !p.hash) p.hash = await hashOf(p.secret);
+  }
+}
+
 // ---------- сеть: ведущий ----------
+const host = { ready: false, handingOff: null, backupTimer: null };
+
 function startHost(room, state) {
   session = { role: 'host', room };
   store.set('dg.session', { ...session, broker: BROKER });
-  hostState = state;
+  hostState = E.normalize(state);
+  host.ready = false;
+  host.handingOff = null;
   for (const p of hostState.players) p.online = p.secret === secret;
-  net = hostNet({
+  const me = net = hostNet({
     url: BROKER,
     room,
     secret,
     onStatus: setNetStatus,
     onPresence: (s, online) => { if (E.setOnline(hostState, s, online, caseOf(hostState))) broadcast(); },
-    onMessage: (from, msg) => {
-      if (msg.t === 'hello') {
-        const known = hostState.players.some((p) => p.secret === from);
-        if (!known && hostState.phase !== 'lobby') {
-          // Игра идёт, а устройство незнакомое: предлагаем вернуться на своё место.
-          net.send(from, { t: 'seats', seats: E.seatsFor(hostState) });
-          return;
-        }
-        const res = E.addPlayer(hostState, { secret: from, name: msg.name });
-        if (!res.ok) net.send(from, { t: 'rejected', msg: res.error });
-        broadcast();
-      } else if (msg.t === 'claim') {
-        const res = E.claimSeat(hostState, caseOf(hostState), from, msg.pid);
-        if (!res.ok) { net.send(from, { t: 'seats', seats: E.seatsFor(hostState), msg: res.error }); return; }
-        net.forget(res.oldSecret);
-        broadcast();
-      } else if (msg.t === 'act') {
-        const res = E.applyAction(hostState, caseOf(hostState), from, msg.action);
-        if (!res.ok) net.send(from, { t: 'error', msg: res.error });
-        else {
-          if (res.kicked) net.send(res.kicked, { t: 'rejected', msg: 'Ведущий убрал вас из комнаты.' });
-          broadcast();
-        }
+    onEpoch: (e) => {
+      if (net !== me || !hostState) return;
+      const cmp = E.compareEpoch(e, hostState);
+      if (cmp > 0) {
+        const name = hostState.players.find((p) => p.pid === e.hostPid)?.name;
+        demote(name ? `Теперь ведущий — ${name}` : 'Роль ведущего перешла другому игроку');
+      } else if (cmp < 0 && host.ready) {
+        // Вернулся старый ведущий и затёр объявление — восстанавливаем своё.
+        net.announce({ epoch: hostState.epoch, token: hostState.token, hostPid: hostState.hostPid });
+        publishBackup();
       }
     },
+    onReady: () => {
+      if (net !== me || !hostState) return;
+      host.ready = true;
+      net.announce({ epoch: hostState.epoch, token: hostState.token, hostPid: hostState.hostPid });
+      broadcast();
+    },
+    onMessage: (from, msg) => { if (net === me) hostMessage(from, msg); },
   });
   broadcast();
+}
+
+async function hostMessage(from, msg) {
+  if (msg.t === 'hello') {
+    let known = hostState.players.some((p) => p.secret === from);
+    if (!known) {
+      // После смены ведущего игроки представляются заново: узнаём их по отпечатку.
+      const m = E.matchByHash(hostState, from, await hashOf(from));
+      if (m) { broadcast(); return; }
+    }
+    known = hostState.players.some((p) => p.secret === from);
+    if (!known && hostState.phase !== 'lobby') {
+      // Игра идёт, а устройство незнакомое: предлагаем вернуться на своё место.
+      net.send(from, { t: 'seats', seats: E.seatsFor(hostState) });
+      return;
+    }
+    const res = E.addPlayer(hostState, { secret: from, name: msg.name });
+    if (!res.ok) net.send(from, { t: 'rejected', msg: res.error });
+    broadcast();
+  } else if (msg.t === 'claim') {
+    const res = E.claimSeat(hostState, caseOf(hostState), from, msg.pid);
+    if (!res.ok) { net.send(from, { t: 'seats', seats: E.seatsFor(hostState), msg: res.error }); return; }
+    res.player.hash = await hashOf(from);
+    if (res.oldSecret) net.forget(res.oldSecret);
+    broadcast();
+  } else if (msg.t === 'act') {
+    if (host.handingOff) { net.send(from, { t: 'error', msg: 'Ведущий передаёт роль. Повторите через пару секунд.' }); return; }
+    const res = E.applyAction(hostState, caseOf(hostState), from, msg.action);
+    if (!res.ok) net.send(from, { t: 'error', msg: res.error });
+    else {
+      if (res.kicked) net.send(res.kicked, { t: 'rejected', msg: 'Ведущий убрал вас из комнаты.' });
+      broadcast();
+    }
+  }
 }
 
 function broadcast() {
   store.set('dg.host.' + session.room, hostState);
   const cd = caseOf(hostState);
-  for (const p of hostState.players) {
-    if (p.secret === secret) continue;
-    net.send(p.secret, { t: 'state', view: E.viewFor(hostState, cd, p.secret) }, true);
+  if (host.ready) {
+    for (const p of hostState.players) {
+      if (!p.secret || p.secret === secret) continue;
+      net.send(p.secret, { t: 'state', view: E.viewFor(hostState, cd, p.secret) }, true);
+    }
+    scheduleBackup();
   }
   setView(E.viewFor(hostState, cd, secret));
+}
+
+// Резервная копия на брокере: по ней другой игрок сможет стать ведущим, если этот вылетит.
+function scheduleBackup() {
+  clearTimeout(host.backupTimer);
+  host.backupTimer = setTimeout(publishBackup, 400);
+}
+async function publishBackup(force = false) {
+  clearTimeout(host.backupTimer);
+  if (!hostState || !host.ready || (host.handingOff && !force)) return;
+  await ensureHashes();
+  if (!hostState || !host.ready) return;
+  net.backup({ room: session.room, savedAt: Date.now(), ...E.backupOf(hostState) });
+}
+
+// Добровольная передача роли игроку в сети.
+async function handOff(pid) {
+  const p = hostState.players.find((x) => x.pid === pid);
+  if (!p || !p.online || !p.secret || p.secret === secret) { toast('Передать роль можно только игроку в сети.'); return; }
+  host.handingOff = pid;
+  await publishBackup(true);
+  net.send(p.secret, { t: 'handoff' });
+  toast(`Передаём роль ведущего: ${p.name}…`);
+  const epoch = hostState.epoch;
+  setTimeout(() => {
+    if (session?.role === 'host' && host.handingOff === pid && hostState?.epoch === epoch) {
+      host.handingOff = null;
+      toast(`${p.name} не ответил(а). Вы остаётесь ведущим.`);
+    }
+  }, 12000);
+}
+
+// Нас сменил другой ведущий: становимся обычным игроком.
+function demote(message) {
+  if (session?.role !== 'host') return;
+  const room = session.room;
+  clearTimeout(host.backupTimer);
+  host.ready = false;
+  host.handingOff = null;
+  try { net.close(); } catch (_) { /* уже закрыто */ }
+  store.del('dg.host.' + room);
+  hostState = null;
+  startClient(room, store.get('dg.name', ''));
+  if (message) toast(message);
 }
 
 // ---------- сеть: игрок ----------
@@ -130,26 +240,39 @@ function startClient(room, name) {
   session = { role: 'client', room };
   store.set('dg.session', { ...session, broker: BROKER });
   ui.joinSlow = false;
+  ui.takingOver = false;
   clearTimeout(ui.joinTimer);
   ui.joinTimer = setTimeout(() => { if (!view) { ui.joinSlow = true; render(); } }, 10000);
-  net = clientNet({
+  const me = net = clientNet({
     url: BROKER,
     room,
     secret,
     name,
     onStatus: setNetStatus,
-    onHost: (online) => { ui.hostOnline = online; render(); },
+    onHost: (online) => {
+      if (net !== me) return;
+      ui.hostOnline = online;
+      clearTimeout(ui.hostTimer);
+      ui.hostOffSince = online ? 0 : Date.now();
+      if (!online) ui.hostTimer = setTimeout(render, TAKEOVER_AFTER_MS + 100);
+      render();
+    },
     onMessage: (msg) => {
+      if (net !== me) return;
       if (msg.t === 'state') {
         ui.seats = null;
         clearInterval(ui.seatsTimer);
-        if (!view || msg.view.rev >= view.rev || msg.view.phase !== view.phase) setView(msg.view);
+        const cmp = view ? E.compareEpoch(msg.view, view) : 1;
+        if (cmp < 0) return; // устаревший ведущий
+        if (cmp > 0 || !view || msg.view.rev >= view.rev || msg.view.phase !== view.phase) setView(msg.view);
       } else if (msg.t === 'seats') {
         if (view) return;
         ui.seats = { list: msg.seats, msg: msg.msg || '' };
         clearInterval(ui.seatsTimer);
         ui.seatsTimer = setInterval(() => net?.hello(), 4000);
         render();
+      } else if (msg.t === 'handoff') {
+        becomeHost('Ведущий передал вам свою роль');
       } else if (msg.t === 'error') {
         toast(msg.msg);
       } else if (msg.t === 'rejected') {
@@ -158,6 +281,70 @@ function startClient(room, name) {
     },
   });
   render();
+}
+
+const TAKEOVER_AFTER_MS = 15000;
+
+// Раскрывающиеся блоки перерисовываются после каждого хода — помним, какие открыл игрок.
+const openState = {};
+function openAttr(key, byDefault) {
+  const open = key in openState ? openState[key] : byDefault;
+  return `data-key="${key}"${open ? ' open' : ''}`;
+}
+// Запоминаем сразу по клику: событие toggle приходит позже и может попасть на уже перерисованный блок.
+document.addEventListener('click', (e) => {
+  const d = e.target.closest?.('summary')?.parentElement;
+  if (d?.tagName === 'DETAILS' && d.dataset.key) openState[d.dataset.key] = !d.open;
+}, true);
+
+function hostAwayHtml(cls) {
+  if (ui.takingOver) return `<div class="${cls}"><span>Берём роль ведущего…</span></div>`;
+  return `<div class="${cls}">
+    <span>Ведущий не в сети. ${canTakeOver()
+      ? 'Если он не возвращается, любой из вас может стать ведущим — партия продолжится с того же места.'
+      : 'Ждём его возвращения. Если он не вернётся за 15 секунд, любой из вас сможет стать ведущим.'}</span>
+    ${canTakeOver() ? '<button class="btn btn--small btn--primary" data-act="takeover">Стать ведущим</button>' : ''}
+  </div>`;
+}
+
+function confirmTakeover() {
+  if (confirm('Стать ведущим? Игра будет идти через ваше устройство — не закрывайте вкладку до конца партии.')) becomeHost();
+}
+
+function handOffHtml() {
+  const others = view.players.filter((p) => p.pid !== view.me && p.online);
+  if (!view.isHost || !others.length) return '';
+  return `<details class="handoff" ${openAttr('handoff', false)}>
+    <summary>Передать роль ведущего</summary>
+    <p class="hint">Если вам нужно уйти, передайте роль другому игроку: партия продолжится через его устройство, а вы останетесь в игре обычным сыщиком.</p>
+    <div class="row">${others.map((p) => `<button class="btn btn--small" data-handoff="${esc(p.pid)}">${esc(p.name)}</button>`).join('')}</div>
+  </details>`;
+}
+const canTakeOver = () => session?.role === 'client' && view && !ui.hostOnline && ui.hostOffSince && Date.now() - ui.hostOffSince >= TAKEOVER_AFTER_MS;
+
+// Взять роль ведущего: по резервной копии с брокера.
+async function becomeHost(message) {
+  if (session?.role !== 'client' || ui.takingOver) return;
+  ui.takingOver = true;
+  render();
+  const room = session.room;
+  const data = await net.fetchBackup();
+  if (session?.role !== 'client' || session.room !== room) return;
+  if (!data || data.room !== room) {
+    ui.takingOver = false;
+    toast('Не удалось получить копию партии. Попробуйте ещё раз.');
+    render();
+    return;
+  }
+  const res = E.takeOver(data, secret, await hashOf(secret));
+  if (!res.ok) { ui.takingOver = false; toast(res.error); render(); return; }
+  delete res.state.room;
+  delete res.state.savedAt;
+  net.close();
+  ui.takingOver = false;
+  ui.hostOnline = true;
+  startHost(room, res.state);
+  toast(message || 'Вы — ведущий. Не закрывайте эту вкладку.');
 }
 
 function act(action) {
@@ -170,6 +357,7 @@ function act(action) {
       broadcast();
       return;
     }
+    if (action.type === 'handoff') { handOff(action.pid); return; }
     const res = E.applyAction(hostState, caseOf(hostState), secret, action);
     if (!res.ok) { toast(res.error); return; }
     if (res.kicked) net.send(res.kicked, { t: 'rejected', msg: 'Ведущий убрал вас из комнаты.' });
@@ -379,7 +567,9 @@ function renderSeats() {
 }
 
 function playerChips() {
-  return view.players.map((p) => {
+  return view.players.map((p0) => {
+    // Если ведущий вылетел, обновлять список некому — его статус знаем сами.
+    const p = p0.pid === view.hostPid && !view.isHost && !ui.hostOnline ? { ...p0, online: false } : p0;
     const turn = p.pid === view.turnPid;
     return `<li class="chip ${turn ? 'chip--turn' : ''} ${p.online ? '' : 'chip--off'}">
       <span class="dot" title="${p.online ? 'в сети' : 'не в сети'}"></span>
@@ -410,8 +600,8 @@ function renderLobby() {
           ${view.players.map((p, i) => `
             <li class="${p.online ? '' : 'off'}">
               <span class="dot"></span>
-              <span>${esc(p.name)}${p.pid === view.me ? ' <small>(вы)</small>' : ''}${i === 0 ? ' <small>ведущий</small>' : ''}</span>
-              ${isHost && i > 0 ? `<button class="x" data-kick="${esc(p.pid)}" aria-label="Убрать ${esc(p.name)}">×</button>` : ''}
+              <span>${esc(p.name)}${p.pid === view.me ? ' <small>(вы)</small>' : ''}${p.pid === view.hostPid ? ' <small>ведущий</small>' : ''}</span>
+              ${isHost && p.pid !== view.hostPid ? `<button class="x" data-kick="${esc(p.pid)}" aria-label="Убрать ${esc(p.name)}">×</button>` : ''}
             </li>`).join('')}
         </ul>
       </section>
@@ -422,7 +612,8 @@ function renderLobby() {
              <p class="hint">Каждое дело можно сыграть один раз: второй раз оно уже не загадка.</p>`
           : caseTile(cd, { selected: true })}
       </section>
-      ${!ui.hostOnline && !isHost ? `<p class="alert">Ведущий не в сети. Ждём его возвращения…</p>` : ''}
+      ${!ui.hostOnline && !isHost ? hostAwayHtml('alert alert--row') : ''}
+      ${handOffHtml()}
       ${isHost
         ? `<button class="btn btn--primary btn--big" data-act="start">Начать расследование</button>
            <p class="hint center">Не закрывайте эту вкладку: игра идёт через ваше устройство.</p>`
@@ -434,14 +625,16 @@ function renderLobby() {
     </main>`;
   renderStatus();
   app.onclick = (e) => {
-    const b = e.target.closest('[data-act],[data-kick],[data-case]');
+    const b = e.target.closest('[data-act],[data-kick],[data-case],[data-handoff]');
     if (!b) return;
+    if (b.dataset.handoff) return confirmHandoff(b.dataset.handoff);
     if (b.dataset.kick) return act({ type: 'kick', pid: b.dataset.kick });
     if (b.dataset.case) return act({ type: 'case', caseId: b.dataset.case });
     const a = b.dataset.act;
     if (a === 'start') act({ type: 'start' });
     if (a === 'rules') openRules();
     if (a === 'leave') confirmLeave();
+    if (a === 'takeover') confirmTakeover();
     if (a === 'copy') copyInvite();
     if (a === 'share') shareInvite();
   };
@@ -477,9 +670,14 @@ async function shareInvite() {
   copyInvite();
 }
 
+function confirmHandoff(pid) {
+  const p = view.players.find((x) => x.pid === pid);
+  if (p && confirm(`Передать роль ведущего игроку ${p.name}?`)) act({ type: 'handoff', pid });
+}
+
 function confirmLeave() {
   const msg = session.role === 'host'
-    ? 'Выйти из игры? Вы ведущий: без вас игра остановится для всех.'
+    ? 'Выйти из игры? Вы ведущий. Лучше сначала передайте роль другому игроку. Если просто выйти, игра встанет, пока кто-нибудь не станет ведущим.'
     : 'Выйти из игры? Вернуться можно будет по той же ссылке.';
   if (confirm(msg)) leave();
 }
@@ -546,8 +744,9 @@ function ensureGameSkeleton() {
   });
 
   app.onclick = (e) => {
-    const b = e.target.closest('[data-act],[data-tab],[data-play],[data-archive],[data-confirm],[data-answer],[data-drop]');
+    const b = e.target.closest('[data-act],[data-tab],[data-play],[data-archive],[data-confirm],[data-answer],[data-drop],[data-handoff]');
     if (!b) return;
+    if (b.dataset.handoff) { confirmHandoff(b.dataset.handoff); return; }
     if (b.dataset.tab) { ui.tab = b.dataset.tab; renderGame(); window.scrollTo({ top: 0 }); return; }
     if (b.dataset.play) { act({ type: 'play', cardId: b.dataset.play }); ui.confirmArchive = null; return; }
     if (b.dataset.archive) { ui.confirmArchive = b.dataset.archive; renderGame(); return; }
@@ -567,6 +766,7 @@ function ensureGameSkeleton() {
     if (a === 'leave') confirmLeave();
     if (a === 'skip') act({ type: 'skip' });
     if (a === 'reconnect') net?.restart();
+    if (a === 'takeover') confirmTakeover();
     if (b.dataset.drop) {
       const p = view.players.find((x) => x.pid === b.dataset.drop);
       if (p && confirm(`Раздать карты игрока ${p.name} остальным? Если игрок вернётся, то доберёт новые карты из колоды.`)) act({ type: 'drop', pid: p.pid });
@@ -593,7 +793,7 @@ function renderGame() {
   const banner = document.getElementById('banner');
   let b = '';
   if (ui.netBad) b += `<div class="banner banner--bad"><span>Нет связи. Переподключаемся…</span><button class="btn btn--small" data-act="reconnect">Переподключить</button></div>`;
-  if (!ui.hostOnline && !view.isHost) b += `<div class="banner banner--bad">Ведущий не в сети. Ждём его возвращения: игра продолжится с того же места.</div>`;
+  if (!ui.hostOnline && !view.isHost) b += hostAwayHtml('banner banner--bad');
   else if (view.phase === 'play') {
     const cur = view.players.find((p) => p.pid === view.turnPid);
     if (view.turnPid === view.me) {
@@ -678,12 +878,12 @@ function renderTable(cd) {
   const others = view.players.filter((p) => p.pid !== view.me && p.handTitles.length);
   const items = [...view.table].reverse();
   el.innerHTML = `
-    <details class="intro" ${view.table.length < 3 ? 'open' : ''}>
+    <details class="intro" ${openAttr('intro', view.table.length < 3)}>
       <summary>Вводная: ${esc(cd.title)}</summary>
       ${cd.intro.map((p) => `<p>${esc(p)}</p>`).join('')}
     </details>
     ${view.phase === 'play' && others.length ? `
-      <details class="others" open>
+      <details class="others" ${openAttr('others', true)}>
         <summary>У других на руках</summary>
         <p class="hint">Названия карт можно знать всем. Содержание — нет.</p>
         ${others.map((p) => `
@@ -695,7 +895,8 @@ function renderTable(cd) {
     ${items.length ? `<div class="table">${items.map((t) => cardHtml(cd, t.id, {
       footer: t.by ? `<footer class="card__by">Выложено: ${esc(playerName(t.by))}</footer>` : '',
     })).join('')}</div>` : `<p class="empty">Пока пусто. Первые карты с числом 0 можно выложить сразу.</p>`}
-    <details class="log">
+    ${handOffHtml()}
+    <details class="log" ${openAttr('log', false)}>
       <summary>Журнал хода игры</summary>
       <ol>${[...view.log].reverse().map((l) => `<li>${esc(l.text)}</li>`).join('')}</ol>
     </details>`;
@@ -804,12 +1005,12 @@ function renderResult(cd) {
         </li>`;
       }).join('')}
     </ol>
-    <details class="solution" open>
+    <details class="solution" ${openAttr('solution', true)}>
       <summary>Разгадка</summary>
       ${cd.solution.map((p) => `<p>${esc(p)}</p>`).join('')}
     </details>
     ${view.archive?.length ? `
-      <details class="archive">
+      <details class="archive" ${openAttr('archive', false)}>
         <summary>Что лежало в архиве (${view.archive.length})</summary>
         <div class="table">${view.archive.map((a) => cardHtml(cd, a.id, { footer: `<footer class="card__by">В архив отправлено: ${esc(playerName(a.by))}</footer>` })).join('')}</div>
       </details>` : ''}
@@ -839,6 +1040,7 @@ function openRules() {
         <li>В конце все вместе отвечают на вопросы. Когда все нажмут «Готовы», вы узнаете счёт и разгадку.</li>
       </ol>
       <p><b>Если кто-то вылетел</b>, пусть снова откроет ссылку на игру. С того же телефона он вернётся сразу, с другого — выберет своё имя в списке. Если игрок не возвращается, ведущий может раздать его карты остальным и доиграть без него.</p>
+      <p><b>Ведущий</b> может передать свою роль другому игроку (внизу вкладки «Стол»). Если ведущий вылетел и не вернулся за 15 секунд, любой игрок может нажать «Стать ведущим» — партия продолжится с того же места.</p>
       <p class="hint">Записывать улики нельзя — полагайтесь на память. Обсуждать выложенные карты можно в чате или голосом. Игра одноразовая: второй раз дело уже не загадка.</p>
       <button class="btn btn--primary">Понятно</button>
     </form>`;

@@ -44,6 +44,8 @@ b { font-weight: 700; }
 .hint { color: var(--muted); font-size: 14px; }
 .center { text-align: center; justify-content: center; }
 .code { font-family: var(--mono); letter-spacing: .12em; color: var(--brass); }
+.alert--row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.handoff .row { margin-top: 4px; }
 .alert { border: 1px solid var(--red); background: color-mix(in srgb, var(--red) 15%, transparent); padding: 10px 14px; border-radius: var(--radius); }
 .empty { color: var(--muted); font-style: italic; font-family: var(--serif); }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }

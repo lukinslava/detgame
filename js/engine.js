@@ -35,9 +35,65 @@ export function createGame(caseData, host) {
     ready: {},
     result: null,
     rev: 0,
+    // Номер «срока» ведущего. Растёт при каждой смене ведущего; у кого номер больше — тот и ведущий.
+    epoch: 1,
+    token: randomId(8),
   };
-  addPlayer(state, host);
+  const { player: hp } = addPlayer(state, host);
+  state.hostPid = hp.pid;
   return state;
+}
+
+// Состояние, сохранённое старой версией игры, — дополняем новыми полями.
+export function normalize(state) {
+  if (!state.hostPid) state.hostPid = state.players.find((p) => p.secret === state.hostSecret)?.pid;
+  if (!state.epoch) state.epoch = 1;
+  if (!state.token) state.token = randomId(8);
+  return state;
+}
+
+// Сравнение сроков ведущего: (номер, жетон). Больше — новее.
+export function compareEpoch(a, b) {
+  return (a.epoch - b.epoch) || (a.token > b.token ? 1 : a.token < b.token ? -1 : 0);
+}
+
+// Резервная копия партии для смены ведущего. Секреты игроков в неё не попадают —
+// только их отпечатки (hash), по которым новый ведущий узнает вернувшихся игроков.
+export function backupOf(state) {
+  const copy = JSON.parse(JSON.stringify(state));
+  delete copy.hostSecret;
+  for (const p of copy.players) delete p.secret;
+  return copy;
+}
+
+// Игрок с отпечатком myHash берёт на себя роль ведущего по резервной копии.
+export function takeOver(backup, mySecret, myHash) {
+  const state = JSON.parse(JSON.stringify(backup));
+  const me = state.players.find((p) => p.hash && p.hash === myHash);
+  if (!me) return { ok: false, error: 'Вас нет в этой партии.' };
+  for (const p of state.players) {
+    p.secret = p === me ? mySecret : null;
+    p.online = p === me;
+  }
+  const old = state.players.find((p) => p.pid === state.hostPid);
+  state.hostSecret = mySecret;
+  state.hostPid = me.pid;
+  state.epoch = (state.epoch || 1) + 1;
+  state.token = randomId(8);
+  state.ready = {};
+  log(state, `${me.name} становится ведущим${old && old !== me ? ` вместо ${old.name}` : ''}`);
+  state.rev++;
+  return { ok: true, state };
+}
+
+// После смены ведущего игроки заходят заново: узнаём их по отпечатку секрета.
+export function matchByHash(state, secret, hash) {
+  const p = state.players.find((x) => !x.secret && x.hash && x.hash === hash);
+  if (!p) return null;
+  p.secret = secret;
+  p.online = true;
+  state.rev++;
+  return p;
 }
 
 // Смена дела в комнате ожидания. Проверку, что дело существует, делает вызывающий код.
@@ -125,7 +181,7 @@ export function claimSeat(state, caseData, newSecret, pid) {
   if (player(state, newSecret)) return { ok: false, error: 'Вы уже в игре.' };
   const p = state.players.find((x) => x.pid === pid);
   if (!p) return { ok: false, error: 'Такого игрока нет.' };
-  if (p.secret === state.hostSecret) return { ok: false, error: 'Место ведущего занять нельзя.' };
+  if (p.pid === state.hostPid) return { ok: false, error: 'Место ведущего занять нельзя. Если ведущий вылетел, любой игрок может стать ведущим.' };
   if (p.online) return { ok: false, error: `${p.name} сейчас в сети. Если это вы на старом устройстве — подождите минуту, пока оно отключится, и попробуйте снова.` };
   const oldSecret = p.secret;
   p.secret = newSecret;
@@ -142,7 +198,7 @@ export function seatsFor(state) {
     pid: p.pid,
     name: p.name,
     online: p.online,
-    host: p.secret === state.hostSecret,
+    host: p.pid === state.hostPid,
   }));
 }
 
@@ -244,7 +300,7 @@ export function applyAction(state, caseData, secret, action) {
       if (!isHost) return { ok: false, error: 'Только ведущий может убрать игрока.' };
       if (state.phase !== 'lobby') return { ok: false, error: 'Убрать игрока можно только до начала игры.' };
       const idx = state.players.findIndex((x) => x.pid === a.pid);
-      if (idx <= 0) return { ok: false, error: 'Нельзя убрать этого игрока.' };
+      if (idx < 0 || state.players[idx].pid === state.hostPid) return { ok: false, error: 'Нельзя убрать этого игрока.' };
       const [gone] = state.players.splice(idx, 1);
       log(state, `${gone.name} покидает комнату`);
       state.rev++;
@@ -297,7 +353,7 @@ export function applyAction(state, caseData, secret, action) {
       if (state.phase !== 'play') return { ok: false, error: 'Сейчас это не нужно.' };
       const idx = state.players.findIndex((x) => x.pid === a.pid);
       const gone = state.players[idx];
-      if (!gone || gone.secret === state.hostSecret) return { ok: false, error: 'Нельзя убрать этого игрока.' };
+      if (!gone || gone.pid === state.hostPid) return { ok: false, error: 'Нельзя убрать этого игрока.' };
       if (gone.online) return { ok: false, error: `${gone.name} в сети — пусть ходит сам.` };
       const others = [];
       for (let i = 1; i < state.players.length; i++) {
@@ -393,7 +449,9 @@ export function viewFor(state, caseData, secret) {
     phase: state.phase,
     me: me ? me.pid : null,
     isHost: secret === state.hostSecret,
-    hostPid: state.players[0]?.pid,
+    hostPid: state.hostPid,
+    epoch: state.epoch,
+    token: state.token,
     players: state.players.map((p) => ({
       pid: p.pid,
       name: p.name,
