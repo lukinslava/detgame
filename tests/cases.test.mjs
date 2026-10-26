@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CASE_LIST, CASES, DIFFICULTY } from '../js/cases/index.js';
+import { artSvg, coverSvg } from '../js/art.js';
 import { createGame, addPlayer, applyAction, canPlayFaceUp, setCase, score } from '../js/engine.js';
 
 for (const cd of CASE_LIST) {
@@ -21,6 +22,13 @@ for (const cd of CASE_LIST) {
       for (const m of c.marks || []) assert.ok(cd.map.points[m], `${c.id}: нет точки ${m}`);
     }
     assert.ok(cd.cards.slice(0, 6).filter((c) => c.value === 0).length >= 2, 'в начале колоды есть карты с нулём');
+
+    // иллюстрации
+    assert.ok(coverSvg(cd.id), 'есть обложка');
+    for (const c of cd.cards) {
+      assert.ok(c.art, `${c.id}: нет картинки`);
+      assert.ok(artSvg(c.art, cd).startsWith('<svg'), `${c.id}: картинка «${c.art}» не рисуется`);
+    }
 
     // схема
     const { width, height, shapes, points } = cd.map;

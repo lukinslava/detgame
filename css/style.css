@@ -218,6 +218,32 @@ button.case:hover { border-color: var(--brass); }
 .card__by { margin-top: 10px; font: 12px/1.3 var(--sans); color: var(--ink-muted); }
 .card--end .card__by { color: var(--muted); }
 
+/* ---------- иллюстрации ---------- */
+.card__art {
+  --art-bg: #e4d6b4;
+  margin: -14px -16px 12px; height: 104px; display: grid; place-items: center;
+  border-radius: 8px 8px 0 0; border-bottom: 1px solid var(--paper-line); color: var(--ink);
+  background:
+    repeating-linear-gradient(-45deg, transparent 0 7px, rgba(42, 33, 24, .05) 7px 8px),
+    var(--art-bg);
+}
+.card__art svg { height: 92px; width: auto; display: block; }
+@media (max-width: 600px) { .card__art { height: 88px; } .card__art svg { height: 76px; } }
+.card--scene .card__art { --art-bg: #dcd3bf; }
+.card--twist .card__art { --art-bg: #ecd0c0; color: var(--red-paper); }
+.card--end .card__art { --art-bg: #2a2620; color: var(--brass); background: var(--art-bg); border-bottom-color: var(--brass); }
+.cover {
+  --art-bg: #e4d6b4;
+  display: block; aspect-ratio: 3 / 1; width: 100%; overflow: hidden; border-radius: 6px; color: var(--ink);
+  background:
+    repeating-linear-gradient(-45deg, transparent 0 7px, rgba(42, 33, 24, .05) 7px 8px),
+    var(--art-bg);
+}
+.cover svg { width: 100%; height: 100%; display: block; }
+.case .cover { margin-bottom: 6px; }
+.intro .cover { margin-bottom: 12px; }
+.result .cover { margin: -8px 0 14px; }
+
 /* ---------- стол ---------- */
 details { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 0 14px; margin-bottom: 12px; }
 details > summary { cursor: pointer; padding: 12px 0; font-weight: 700; list-style-position: inside; }
