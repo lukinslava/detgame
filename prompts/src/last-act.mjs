@@ -14,6 +14,19 @@ export default {
     glafira: 'an elderly costume mistress in a headscarf and apron, pins between her lips',
     reporter: 'a journalist in a bowler hat with a moustache and a notepad',
   },
+  // Как персонажей называть в коротких сообщениях для ChatGPT.
+  names: {
+    rostovtsev: 'Rostovtsev the star actor',
+    zharov: 'Zharov the actor',
+    nina: 'Nina Valueva the prima',
+    liza: 'Liza Orlova the young actress',
+    mitya: 'Mitya the understudy',
+    belsky: 'Belsky the director',
+    kudrin: 'Kudrin the props master',
+    zoya: 'Zoya the stage manager',
+    glafira: 'Glafira the costume mistress',
+    reporter: 'the reporter',
+  },
   cards: {
     m01: 'A theatre stage at the climax of a play: an actor in a count\'s costume lying by the footlights, another actor in a cavalry uniform standing over him with a revolver, horrified; the audience in shadow. No gore',
     m02: 'A backstage wall covered with 1920s constructivist theatre posters and actors\' portraits, comedy and tragedy masks hanging on a nail',

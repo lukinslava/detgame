@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CASE_LIST } from '../js/cases/index.js';
-import { SOURCES, fullPrompt, allPrompts } from '../prompts/build.mjs';
+import { SOURCES, fullPrompt, allPrompts, chatCard, chatSetup } from '../prompts/build.mjs';
 
 for (const cd of CASE_LIST) {
   test(`${cd.title}: промпты на все карты`, () => {
@@ -13,7 +13,11 @@ for (const cd of CASE_LIST) {
       assert.ok(src.cards[c.id], `${c.id}: нет промпта`);
       const p = fullPrompt(src, src.cards[c.id]);
       assert.ok(!/[{}]/.test(p), `${c.id}: не подставлен персонаж`);
+      const m = chatCard(src, c.id, src.cards[c.id]);
+      assert.ok(!/[{}]/.test(m), `${c.id}: в сообщении для ChatGPT не подставлено имя`);
     }
+    for (const id of Object.keys(src.people)) assert.ok(src.names?.[id], `нет имени для ${id}`);
+    assert.ok(chatSetup(cd, src).includes(src.cover));
     for (const id of Object.keys(src.cards)) assert.ok(cd.cards.some((c) => c.id === id), `лишний промпт ${id}`);
   });
 }

@@ -11,6 +11,16 @@ export default {
     tamara: 'a 45-year-old station cook in a headscarf and apron',
     markin: 'a 38-year-old man in glasses posing as a geologist, in too-clean expedition clothes, with a shifty smile',
   },
+  // Как персонажей называть в коротких сообщениях для ChatGPT.
+  names: {
+    gromov: 'Gromov the station chief',
+    somov: 'Somov the meteorologist',
+    kaplan: 'Kaplan the radio operator',
+    irina: 'Irina the hydrologist',
+    stepan: 'Stepan the mechanic',
+    tamara: 'Tamara the cook',
+    markin: 'Markin the "geologist"',
+  },
   cards: {
     p01: 'A body lying face down in an orange storm jacket in the snow near a meteorological instrument site at night, a broken flashlight beside it, a steel guide rope nearby, blizzard. Tasteful',
     p02: 'A small Soviet polar station: wooden huts with radio antennas in deep snow under the polar night, warm yellow windows',

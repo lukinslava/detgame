@@ -14,6 +14,19 @@ export default {
     foma: 'a peasant gardener with a beard, in a cap and a sheepskin coat',
     uezd: 'a district doctor in a bowler hat and fur coat, with a moustache and a medical bag',
   },
+  // Как персонажей называть в коротких сообщениях для ChatGPT.
+  names: {
+    gordeev: 'Gordeev the landowner',
+    dmitry: "Dmitry, Gordeev's son",
+    anna: "Anna, Gordeev's young wife",
+    schulz: 'Schulz the estate manager',
+    pastukhov: 'Doctor Pastukhov',
+    sonya: 'Sonya the ward',
+    notary: 'the notary',
+    prokhor: 'Prokhor the old valet',
+    foma: 'Foma the gardener',
+    uezd: 'the district doctor',
+  },
   cards: {
     h01: 'A landowner\'s study at dawn: an old man slumped in an armchair with his head resting on the writing desk, a fireplace poker on the carpet, a burned-out candle, frost on the windows. Tasteful, no gore',
     h02: 'A grand manor house snowed in at night, lit windows, guests\' sleighs buried in snowdrifts',

@@ -12,6 +12,16 @@ export default {
     olga: 'a 30-year-old opera singer with long dark hair, earrings and a scarlet kimono',
     kulikov: 'a 29-year-old secretary with neatly slicked short hair and a bow tie, in a light grey flannel dressing gown',
   },
+  // Как персонажей называть в коротких сообщениях для ChatGPT.
+  names: {
+    lavrov: 'Lavrov the antique dealer',
+    fedor: 'Fyodor the conductor',
+    osten: 'Doctor Osten',
+    vera: "Vera, Lavrov's niece",
+    meshch: 'Captain Meshchersky',
+    olga: 'Olga Stern the singer',
+    kulikov: 'Kulikov the secretary',
+  },
   cards: {
     c01: 'Inside a narrow first-class sleeping compartment at dawn: an elderly man lying still on the lower berth under a blanket pulled up to his chest, a pillow fallen on the floor by the door, the window lowered a hand\'s width, raindrops on the little table and the carpet. Quiet and tasteful, no blood',
     c02: 'The corridor of a 1913 sleeping car seen lengthwise: six numbered compartment doors with brass plates, the conductor\'s service room at the far end, curtains and dimmed lamps',
