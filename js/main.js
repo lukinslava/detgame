@@ -1,6 +1,18 @@
 import { CASES, CASE_LIST, DEFAULT_CASE, DIFFICULTY } from './cases/index.js';
 import * as E from './engine.js';
 import { artSvg, coverSvg } from './art.js';
+import { imageUrl } from './images.js';
+
+// Картинка карты: готовое изображение, если есть, иначе векторный рисунок.
+function cardArt(cd, c) {
+  const url = imageUrl(cd.id, c.id);
+  if (url) return `<div class="card__art card__art--img"><img src="${url}" alt=""></div>`;
+  return c.art ? `<div class="card__art">${artSvg(c.art, cd)}</div>` : '';
+}
+function coverArt(cd) {
+  const url = imageUrl(cd.id, 'cover');
+  return url ? `<img src="${url}" alt="">` : coverSvg(cd.id);
+}
 import { hostNet, clientNet, DEFAULT_BROKER } from './net.js';
 
 const app = document.getElementById('app');
@@ -652,7 +664,7 @@ function caseTile(c, { selected, button } = {}) {
   const tag = button ? 'button' : 'div';
   return `
     <${tag} class="case ${selected ? 'case--on' : ''}" ${button ? `data-case="${esc(c.id)}" aria-pressed="${selected}"` : ''}>
-      <span class="cover">${coverSvg(c.id)}</span>
+      <span class="cover">${coverArt(c)}</span>
       <span class="case__top">${difficultyBadge(c.difficulty)}<span class="case__meta">~${c.minutes} мин</span></span>
       <span class="case__title">${esc(c.title)}</span>
       <span class="case__sub">${esc(c.subtitle)}</span>
@@ -693,7 +705,7 @@ function cardHtml(cd, id, opts = {}) {
   const hasValue = c.type === 'clue' || c.type === 'scene';
   return `
     <article class="card card--${c.type} ${opts.cls || ''}">
-      ${c.art ? `<div class="card__art">${artSvg(c.art, cd)}</div>` : ''}
+      ${cardArt(cd, c)}
       <header class="card__head">
         ${hasValue ? `<span class="card__value" title="Можно выложить, когда в архиве не меньше ${c.value} карт">${c.value}</span>` : `<span class="card__value card__value--mark">${c.type === 'end' ? '■' : '!'}</span>`}
         <h3>${esc(c.title)}</h3>
@@ -883,7 +895,7 @@ function renderTable(cd) {
   el.innerHTML = `
     <details class="intro" ${openAttr('intro', view.table.length < 3)}>
       <summary>Вводная: ${esc(cd.title)}</summary>
-      <div class="cover">${coverSvg(cd.id)}</div>
+      <div class="cover">${coverArt(cd)}</div>
       ${cd.intro.map((p) => `<p>${esc(p)}</p>`).join('')}
     </details>
     ${view.phase === 'play' && others.length ? `
@@ -992,7 +1004,7 @@ function renderResult(cd) {
   }
   el.innerHTML = `
     <section class="result">
-      <div class="cover">${coverSvg(cd.id)}</div>
+      <div class="cover">${coverArt(cd)}</div>
       <p class="eyebrow">Итог расследования</p>
       <p class="score"><b>${r.total}</b> из ${r.max}</p>
       <h2 class="rank">${esc(r.rank.title)}</h2>
