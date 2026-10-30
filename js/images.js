@@ -4,7 +4,7 @@
 export const IMAGES = {
   'night-express': [],
   'last-act': [],
-  'snow-estate': [],
+  'snow-estate': ['cover', 'h01', 'h02', 'h03', 'h04'],
   'polar-night': [],
 };
 

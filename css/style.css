@@ -240,8 +240,8 @@ button.case:hover { border-color: var(--brass); }
     var(--art-bg);
 }
 .cover svg, .cover img { width: 100%; height: 100%; display: block; object-fit: cover; }
-.card__art--img { height: auto; aspect-ratio: 5 / 2; padding: 0; overflow: hidden; background: var(--art-bg); }
-.card__art--img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card__art--img { height: auto; aspect-ratio: 2 / 1; padding: 0; overflow: hidden; background: var(--art-bg); }
+.card__art--img img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 35%; display: block; }
 @media (max-width: 600px) { .card__art--img { height: auto; } }
 .case .cover { margin-bottom: 6px; }
 .intro .cover { margin-bottom: 12px; }
