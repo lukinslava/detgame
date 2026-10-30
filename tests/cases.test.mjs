@@ -44,6 +44,11 @@ for (const cd of CASE_LIST) {
     const qids = new Set(cd.questions.map((q) => q.id));
     assert.equal(qids.size, cd.questions.length);
     for (const q of cd.questions) assert.ok(q.correct >= 0 && q.correct < q.options.length, q.id);
+    // Верный ответ не должен выделяться длиной: иначе его угадывают, не читая улик.
+    for (const q of cd.questions) {
+      const others = q.options.filter((_, i) => i !== q.correct).map((o) => o.length);
+      assert.ok(q.options[q.correct].length <= Math.max(...others) + 5, `${q.id}: верный ответ заметно длиннее остальных`);
+    }
     const max = cd.questions.reduce((s, q) => s + q.points, 0);
     assert.equal(cd.ranks.at(-1).min, 0);
     for (let i = 1; i < cd.ranks.length; i++) assert.ok(cd.ranks[i - 1].min > cd.ranks[i].min);

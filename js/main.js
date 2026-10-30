@@ -974,6 +974,21 @@ function renderChat() {
   if (atBottom) list.scrollTop = list.scrollHeight;
 }
 
+// Порядок вариантов ответа: перемешан, чтобы верный не стоял всегда на одном месте,
+// но одинаков у всех игроков (зависит только от дела и вопроса).
+function optionOrder(cd, q) {
+  let h = 2166136261;
+  // Число в конце подобрано так, чтобы верные ответы не скапливались на одной позиции.
+  for (const ch of cd.id + ':' + q.id + ':2365') h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+  const idx = q.options.map((_, i) => i);
+  for (let i = idx.length - 1; i > 0; i--) {
+    h = Math.imul(h ^ (h >>> 15), 2246822507) >>> 0;
+    const j = h % (i + 1);
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  return idx;
+}
+
 function renderQuestions(cd) {
   const el = document.getElementById('p-hand');
   const allAnswered = cd.questions.every((q) => view.answers[q.id] !== undefined);
@@ -988,7 +1003,7 @@ function renderQuestions(cd) {
         <li class="q">
           <p class="q__text">${esc(q.text)} <small>${q.points} ${plural(q.points, 'очко', 'очка', 'очков')}</small></p>
           <div class="q__opts">
-            ${q.options.map((o, i) => `<button class="opt ${view.answers[q.id] === i ? 'opt--on' : ''}" data-answer="${q.id}:${i}">${esc(o)}</button>`).join('')}
+            ${optionOrder(cd, q).map((i) => `<button class="opt ${view.answers[q.id] === i ? 'opt--on' : ''}" data-answer="${q.id}:${i}">${esc(q.options[i])}</button>`).join('')}
           </div>
         </li>`).join('')}
     </ol>
