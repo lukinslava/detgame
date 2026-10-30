@@ -1,7 +1,13 @@
 import { CASES, CASE_LIST, DEFAULT_CASE, DIFFICULTY } from './cases/index.js';
 import * as E from './engine.js';
 import { artSvg, coverSvg } from './art.js';
-import { imageUrl } from './images.js';
+
+// Список готовых картинок грузим в обход кэша браузера: он меняется при каждом
+// добавлении картинок, а GitHub Pages разрешает браузеру хранить файлы до 10 минут.
+let imageUrl = () => null;
+import(`./images.js?t=${Date.now()}`)
+  .then((m) => { imageUrl = m.imageUrl; if (view) render(); })
+  .catch(() => { /* без списка остаются векторные рисунки */ });
 
 // Картинка карты: готовое изображение, если есть, иначе векторный рисунок.
 function cardArt(cd, c) {
